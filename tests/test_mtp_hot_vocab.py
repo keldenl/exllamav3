@@ -3,7 +3,29 @@ from unittest.mock import patch
 import pytest
 
 from exllamav3.architecture.mtp_hot_vocab import MTPHotVocabConfig
-from exllamav3.architecture.qwen3_5_mtp import validate_mtp_hot_blocks
+from exllamav3.architecture.qwen3_5_mtp import mtp_window_from_env, validate_mtp_hot_blocks
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (None, -1),
+    ("", -1),
+    ("full", -1),
+    ("off", -1),
+    ("-1", -1),
+    ("4096", 4096),
+    ("8192", 8192),
+])
+def test_mtp_window_environment(value, expected):
+    env = {} if value is None else {"EXL3_MTP_WINDOW": value}
+    with patch.dict("os.environ", env, clear = True):
+        assert mtp_window_from_env() == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-2", "invalid"])
+def test_mtp_window_environment_rejects_invalid_values(value):
+    with patch.dict("os.environ", {"EXL3_MTP_WINDOW": value}, clear = True):
+        with pytest.raises(ValueError, match = "EXL3_MTP_WINDOW"):
+            mtp_window_from_env()
 
 
 def test_configuration():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import weakref
 
@@ -19,6 +20,26 @@ from .mtp_hot_vocab import MTPHotVocabConfig
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
+
+
+def mtp_window_from_env() -> int:
+    """Read the experimental Qwen MTP-only attention window.
+
+    An unset value (or ``full``) preserves full-context MTP attention. The
+    target model is unaffected.
+    """
+    value = os.environ.get("EXL3_MTP_WINDOW")
+    if value is None or value.strip().lower() in {"", "full", "off", "-1"}:
+        return -1
+    try:
+        window = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "EXL3_MTP_WINDOW must be a positive integer or 'full'"
+        ) from exc
+    if window <= 0:
+        raise ValueError("EXL3_MTP_WINDOW must be a positive integer or 'full'")
+    return window
 
 
 def validate_mtp_hot_blocks(block_ids: list[int], full_vocab: int):
@@ -55,6 +76,7 @@ class Qwen3_5MTPModel(Model):
             if mtp_hot_vocab_config is not None
             else MTPHotVocabConfig.from_env()
         )
+        self.mtp_window = mtp_window_from_env()
 
         # Module list: optional embed, then pre_fc norms + fc, then num_mtp_layers * TransformerBlock, then norm
         self.input_layer = Qwen3_5MTPInputLayer(
@@ -91,6 +113,7 @@ class Qwen3_5MTPModel(Model):
                 key_v = "v_proj",
                 key_o = "o_proj",
                 qmap = "block.attn",
+                sliding_window = self.mtp_window,
                 q_norm = RMSNorm(
                     config = config,
                     key = f"mtp.layers.{idx}.self_attn.q_norm",
