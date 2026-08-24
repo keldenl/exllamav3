@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -19,6 +20,20 @@ import time
 import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
+
+
+def mtp_long_context_config_from_env() -> tuple[int, int]:
+    threshold = int(os.environ.get("EXL3_MTP_CONTEXT_DRAFT_THRESHOLD", "0"))
+    draft_tokens = int(os.environ.get("EXL3_MTP_LONG_CONTEXT_DRAFT_TOKENS", "0"))
+    if bool(threshold) != bool(draft_tokens):
+        raise ValueError(
+            "EXL3_MTP_CONTEXT_DRAFT_THRESHOLD and EXL3_MTP_LONG_CONTEXT_DRAFT_TOKENS "
+            "must be set together"
+        )
+    if threshold < 0 or draft_tokens < 0:
+        raise ValueError("MTP long-context draft settings must be positive integers")
+    return threshold, draft_tokens
+
 
 class Generator:
 
@@ -166,6 +181,13 @@ class Generator:
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
+        (
+            self.mtp_context_draft_threshold,
+            self.mtp_long_context_draft_tokens,
+        ) = mtp_long_context_config_from_env()
+        self.mtp_profile_enabled = os.environ.get("EXL3_MTP_PROFILE", "0") != "0"
+        self.mtp_cycle_stats = []
+        self._mtp_profile_round = None
         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
 
         # Chunking/partitioning
@@ -623,7 +645,21 @@ class Generator:
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
         # below the confidence target, keeping the first low-confidence token as the label probe
+        context_len = int(cache_seqlens.max().item())
         window = self.num_draft_tokens
+        if self.mtp_context_draft_threshold and context_len >= self.mtp_context_draft_threshold:
+            window = min(window, self.mtp_long_context_draft_tokens)
+        if self.mtp_profile_enabled:
+            self._mtp_profile_round = {
+                "context_len": context_len,
+                "draft_window": window,
+                "cycle_wall_start": time.perf_counter(),
+                "cycle_start": torch.cuda.Event(enable_timing = True),
+                "draft_start": torch.cuda.Event(enable_timing = True),
+                "draft_end": torch.cuda.Event(enable_timing = True),
+            }
+            self._mtp_profile_round["cycle_start"].record()
+            self._mtp_profile_round["draft_start"].record()
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
@@ -664,6 +700,10 @@ class Generator:
 
         if hot_vocab:
             self.draft_ids_pinned[:batch_size, :window].copy_(torch.cat(draft_ids_gpu, dim = -1))
+
+        if self._mtp_profile_round is not None:
+            self._mtp_profile_round["draft_end"].record()
+            self._mtp_profile_round["proposed"] = window
 
         if conf_cols and len(conf_cols) == window:
             self._draft_conf_round = {
@@ -913,10 +953,17 @@ class Generator:
         }
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
+        mtp_prof = self._mtp_profile_round if self.mtp_draft and draft_tokens is not None else None
+        if mtp_prof is not None:
+            mtp_prof["verify_start"] = torch.cuda.Event(enable_timing = True)
+            mtp_prof["verify_end"] = torch.cuda.Event(enable_timing = True)
+            mtp_prof["verify_start"].record()
         batch_logits = self.model.forward(
             input_ids = batch_ids,
             params = params,
         )
+        if mtp_prof is not None:
+            mtp_prof["verify_end"].record()
 
         # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
         # references to recurrent state objects past this iteration.
@@ -954,6 +1001,7 @@ class Generator:
         # Reject the trailing draft positions after the last accepted token at index i: count them, roll back the
         # job's recurrent state and return cache pages to the accepted position
         def reject_remainder(job_, j_, i_, batch_states_):
+            rollback_start = time.perf_counter()
             num_rejected = batch_logits.shape[1] - 1 - i_
             if num_rejected == 0:
                 return 0
@@ -972,6 +1020,8 @@ class Generator:
                     rp = min(page.kv_position, r)
                     page.kv_position -= rp
                     r -= rp
+            if mtp_prof is not None:
+                mtp_prof["rollback_cpu_ms"] += (time.perf_counter() - rollback_start) * 1000.0
             return num_rejected
 
         # Without a draft, each job samples exactly one independent token, so all sampler chains
@@ -1029,6 +1079,12 @@ class Generator:
         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
         # must advance between positions.
         else:
+            if mtp_prof is not None:
+                mtp_prof["sampling_start"] = torch.cuda.Event(enable_timing = True)
+                mtp_prof["sampling_end"] = torch.cuda.Event(enable_timing = True)
+                mtp_prof["sampling_wall_start"] = time.perf_counter()
+                mtp_prof["rollback_cpu_ms"] = 0.0
+                mtp_prof["sampling_start"].record()
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
@@ -1135,6 +1191,11 @@ class Generator:
 
                 accepted_lengths.append(accepted_length)
                 j += 1
+            if mtp_prof is not None:
+                mtp_prof["sampling_end"].record()
+                mtp_prof["sampling_wall_ms"] = (
+                    time.perf_counter() - mtp_prof["sampling_wall_start"]
+                ) * 1000.0
 
         # Update the draft-confidence calibration with this round's verification outcomes (any
         # draft-model mode)
@@ -1177,6 +1238,10 @@ class Generator:
         # Accept new target_hidden if MTP. MTP draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         if self.mtp_draft:
+            if mtp_prof is not None:
+                mtp_prof["repair_start"] = torch.cuda.Event(enable_timing = True)
+                mtp_prof["repair_end"] = torch.cuda.Event(enable_timing = True)
+                mtp_prof["repair_start"].record()
             target_hidden = p_export_states[-1]
             accepted_idx = 0
             for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
@@ -1209,6 +1274,31 @@ class Generator:
                 job.mtp_last_hidden = target_hidden[
                     a_idx:b_idx, accepted_length - 1:accepted_length, :
                 ].clone()
+            if mtp_prof is not None:
+                mtp_prof["repair_end"].record()
+
+        if mtp_prof is not None:
+            cycle_end = torch.cuda.Event(enable_timing = True)
+            cycle_end.record()
+            cycle_end.synchronize()
+            stat = {
+                "context_len": mtp_prof["context_len"],
+                "draft_window": mtp_prof["draft_window"],
+                "verify_q_len": int(draft_tokens.shape[-1]) + 1,
+                "proposed": mtp_prof["proposed"],
+                "accepted": sum(max(0, n - 1) for n in accepted_lengths),
+                "draft_gpu_ms": mtp_prof["draft_start"].elapsed_time(mtp_prof["draft_end"]),
+                "verify_gpu_ms": mtp_prof["verify_start"].elapsed_time(mtp_prof["verify_end"]),
+                "sampling_gpu_ms": mtp_prof["sampling_start"].elapsed_time(mtp_prof["sampling_end"]),
+                "sampling_wall_ms": mtp_prof["sampling_wall_ms"],
+                "rollback_cpu_ms": mtp_prof["rollback_cpu_ms"],
+                "repair_gpu_ms": mtp_prof["repair_start"].elapsed_time(mtp_prof["repair_end"]),
+                "cycle_gpu_ms": mtp_prof["cycle_start"].elapsed_time(cycle_end),
+                "cycle_wall_ms": (time.perf_counter() - mtp_prof["cycle_wall_start"]) * 1000.0,
+            }
+            self.mtp_cycle_stats.append(stat)
+            print("MTP_CYCLE", stat)
+            self._mtp_profile_round = None
 
         # Release pages for completed jobs. Finished and requeued jobs no longer need their active page references.
         # Requeued recurrent jobs may stash the last checkpoint first so the next queued job can resume from cached

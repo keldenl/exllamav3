@@ -4,6 +4,7 @@ import pytest
 
 from exllamav3.architecture.mtp_hot_vocab import MTPHotVocabConfig
 from exllamav3.architecture.qwen3_5_mtp import mtp_window_from_env, validate_mtp_hot_blocks
+from exllamav3.generator.generator import mtp_long_context_config_from_env
 
 
 @pytest.mark.parametrize(("value", "expected"), [
@@ -26,6 +27,29 @@ def test_mtp_window_environment_rejects_invalid_values(value):
     with patch.dict("os.environ", {"EXL3_MTP_WINDOW": value}, clear = True):
         with pytest.raises(ValueError, match = "EXL3_MTP_WINDOW"):
             mtp_window_from_env()
+
+
+def test_mtp_long_context_environment():
+    env = {
+        "EXL3_MTP_CONTEXT_DRAFT_THRESHOLD": "24576",
+        "EXL3_MTP_LONG_CONTEXT_DRAFT_TOKENS": "3",
+    }
+    with patch.dict("os.environ", env, clear = True):
+        assert mtp_long_context_config_from_env() == (24576, 3)
+
+
+@pytest.mark.parametrize("env", [
+    {"EXL3_MTP_CONTEXT_DRAFT_THRESHOLD": "24576"},
+    {"EXL3_MTP_LONG_CONTEXT_DRAFT_TOKENS": "3"},
+    {
+        "EXL3_MTP_CONTEXT_DRAFT_THRESHOLD": "-1",
+        "EXL3_MTP_LONG_CONTEXT_DRAFT_TOKENS": "3",
+    },
+])
+def test_mtp_long_context_environment_rejects_invalid_values(env):
+    with patch.dict("os.environ", env, clear = True):
+        with pytest.raises(ValueError, match = "MTP"):
+            mtp_long_context_config_from_env()
 
 
 def test_configuration():
