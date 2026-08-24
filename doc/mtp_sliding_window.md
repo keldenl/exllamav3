@@ -46,11 +46,38 @@ different greedy completion and lower-acceptance trajectory, so it is not a clea
 paired speed comparison. Fresh-process repeats confirmed that this stack is not
 bitwise deterministic across speculative trajectories.
 
-The best observed long-context improvement was 16K at 100K, +4.6% over full in
-this sample. At 64K, finite windows reached about +5.8%, driven partly by acceptance
-differences. A profiled 64K run showed steady-state MTP draft cost around 8 ms per
-cycle versus roughly 69-83 ms for target verification, so shortening MTP attention
-does not expose a credible large throughput gain on this configuration.
+The end-to-end TPS differences above are trajectory measurements, not evidence of
+an intrinsic sliding-window kernel speedup. They are primarily explained by how many
+drafts were accepted and therefore how many target verification rounds were needed.
+The normalized steady-state cycle costs are nearly flat:
+
+| Context | 2K | 4K | 8K | 16K | Full |
+|---:|---:|---:|---:|---:|---:|
+| 64K ms/verification round | 80.46 | 80.45 | 80.73 | 81.25 | 80.86 |
+| 64K verification rounds | 19 | 19 | 20 | 19 | 20 |
+| 100K ms/verification round | 91.22 | 91.02 | 90.55 | 90.98 | 91.04 |
+| 100K verification rounds | 23 | 23 | 23 | 22 | 23 |
+
+Sliding-window MTP did not demonstrate a significant intrinsic cycle-latency
+reduction through 100K context on this configuration. Observed end-to-end TPS
+differences were primarily explained by variation in speculative acceptance and
+verification-round count. At 100K, for example, 16K is about 90.98 ms/round versus
+91.04 ms/round for the full control (2.0016 s / 22 and 2.0940 s / 23 respectively;
+the table's full value uses the measured 91.04 ms/round from the logged run). The
+feature may still become useful at substantially longer contexts or with a more
+expensive/wider draft model.
+
+A profiled 64K run showed steady-state MTP draft cost around 8 ms per cycle versus
+roughly 70-80+ ms for target verification. Profiling also showed substantial
+run-to-run variation in target verification timing between otherwise comparable
+runs. The target model is untouched by `EXL3_MTP_WINDOW`, so that variation should
+be treated as runtime/profiling noise unless independently reproduced, not attributed
+to the sliding window.
+
+This branch is an archived experiment. Keep the feature here for possible
+200K-262K contexts, wider MTP drafting, or a different hardware/configuration
+regime; do not merge or promote it to the main optimization branch based on these
+results.
 
 Reproduce with `tools/bench_mtp_window.py`. The raw run log is kept outside the
 repository in the sibling experiments directory as `mtp-window-sweep.log`.
